@@ -1,6 +1,7 @@
-fastapi
-uvicorn
+fastapi[all]
+uvicorn[standard]
 opencv-python-headless
 numpy
 onnxruntime
 pydantic
+websockets
