@@ -285,3 +285,128 @@ def health_check():
     Returns API health status.
     """
     return {"status": "ok"}
+
+@app.post("/predict_batch", response_model=PredictionResponse, summary="Predict ASL sign from multiple image frames", tags=["Prediction"])
+async def predict_batch_api(files: List[UploadFile] = File(...)):
+    """
+    SIMPLEST APPROACH: Send multiple frames at once (10-60 frames).
+    No session management needed - just collect frames in your Flutter app and send them all together.
+    
+    Args:
+        files: List of image files (10-60 frames from mobile camera)
+    Returns:
+        PredictionResponse: predicted class index, confidence, Arabic and English labels
+    """
+    if len(files) < MIN_FRAMES_FOR_PREDICTION:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Need at least {MIN_FRAMES_FOR_PREDICTION} frames, got {len(files)}"
+        )
+    
+    if len(files) > SEQUENCE_LENGTH:
+        # Take the most recent frames if too many
+        files = files[-SEQUENCE_LENGTH:]
+    
+    frame_sequence = []
+    
+    for file in files:
+        try:
+            image_bytes = await file.read()
+            npimg = np.frombuffer(image_bytes, np.uint8)
+            frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+            if frame is None:
+                continue  # Skip invalid frames
+            
+            keypoints = extract_keypoints_api(frame)
+            frame_sequence.append(keypoints)
+        except Exception as e:
+            continue  # Skip problematic frames
+    
+    if len(frame_sequence) < MIN_FRAMES_FOR_PREDICTION:
+        raise HTTPException(status_code=400, detail="Not enough valid frames after processing")
+    
+    # Prepare sequence for model
+    sequence = preprocess_sequence_api(frame_sequence)
+    pred_idx, confidence = predict_api_onnx(sequence)
+    
+    arabic = idx2ar.get(pred_idx, "Unknown")
+    english = idx2eng.get(pred_idx, "Unknown")
+    
+    return PredictionResponse(
+        pred_idx=pred_idx,
+        confidence=confidence,
+        arabic=arabic,
+        english=english,
+        session_id="batch",
+        frames_in_buffer=len(frame_sequence),
+        is_prediction_reliable=True
+    )
+
+@app.post("/predict_simple", response_model=PredictionResponse, summary="Predict ASL sign with automatic session", tags=["Prediction"])
+async def predict_simple_api(
+    file: UploadFile = File(...),
+    user_id: Optional[str] = Header(None, alias="X-User-ID")
+):
+    """
+    SIMPLE APPROACH: Automatic session management based on user_id.
+    Just send a simple user identifier (like device ID) and frames accumulate automatically.
+    
+    Args:
+        file: Single image file
+        user_id: Simple user identifier (device ID, username, etc.) in X-User-ID header
+    Returns:
+        PredictionResponse: predicted class index, confidence, Arabic and English labels
+    """
+    # Auto-generate user_id if not provided (uses IP-based identification)
+    if not user_id:
+        # Simple fallback - you could use device ID or any simple identifier
+        user_id = "default_user"
+    
+    # Clean up expired sessions
+    cleanup_expired_sessions()
+    
+    # Auto-create session if needed
+    if user_id not in session_buffers:
+        session_buffers[user_id] = SessionData()
+    
+    session_data = session_buffers[user_id]
+    session_data.update_timestamp()
+    
+    try:
+        image_bytes = await file.read()
+        npimg = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Invalid image file.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
+
+    # Extract keypoints and add to buffer
+    keypoints = extract_keypoints_api(frame)
+    session_data.frame_buffer.append(keypoints)
+    
+    # Maintain rolling buffer
+    if len(session_data.frame_buffer) > SEQUENCE_LENGTH:
+        session_data.frame_buffer.pop(0)
+    
+    frames_count = len(session_data.frame_buffer)
+    is_reliable = frames_count >= MIN_FRAMES_FOR_PREDICTION
+    
+    pred_idx, confidence = -1, 0.0
+    
+    if is_reliable:
+        sequence = preprocess_sequence_api(session_data.frame_buffer)
+        pred_idx, confidence = predict_api_onnx(sequence)
+    
+    arabic = idx2ar.get(pred_idx, "Unknown" if pred_idx != -1 else f"Collecting... {frames_count}/{MIN_FRAMES_FOR_PREDICTION}")
+    english = idx2eng.get(pred_idx, "Unknown" if pred_idx != -1 else f"Collecting... {frames_count}/{MIN_FRAMES_FOR_PREDICTION}")
+    
+    return PredictionResponse(
+        pred_idx=pred_idx,
+        confidence=confidence,
+        arabic=arabic,
+        english=english,
+        session_id=user_id,
+        frames_in_buffer=frames_count,
+        is_prediction_reliable=is_reliable
+    )
